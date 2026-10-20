@@ -21,7 +21,7 @@ from sklearn.preprocessing import StandardScaler
 try:
     import shap
     HAS_SHAP = True
-except Exception:  # fallback keeps the demo alive if shap fails to install
+except Exception: 
     HAS_SHAP = False
 
 try:
@@ -39,7 +39,6 @@ NAMES = {"gpa": "GPA", "test_score": "Test score", "essay_score": "Essay score",
 THRESHOLD = 0.5
 
 
-# ---------------------------------------------------------------- data + model
 @st.cache_data
 def make_data(n=3000, seed=42):
     """Synthetic applicants. Label = noisy weighted merit + financial-need score > cutoff.
@@ -76,7 +75,7 @@ def train():
     cv = {n: float(cross_val_score(m, Xtr, tr.y, cv=5, scoring="roc_auc").mean()) for n, m in cands.items()}
     fitted = {n: m.fit(Xtr, tr.y) for n, m in cands.items()}
     test_auc = {n: float(roc_auc_score(te.y, m.predict_proba(Xte)[:, 1])) for n, m in fitted.items()}
-    best = "Logistic regression"  # prefer the simpler model unless the complex one is clearly better
+    best = "Logistic regression" 
     if "Gradient boosting" in cv and cv["Gradient boosting"] > cv["Logistic regression"] + 0.01:
         best = "Gradient boosting"
     model = fitted[best]
@@ -150,8 +149,6 @@ def plain(f, v, c):
     return (f"{NAMES[f]} ({v:.1f}) {mag} {'raised' if c > 0 else 'lowered'} the chance of being shortlisted "
             f"({c:+.2f} log-odds)")
 
-
-# ---------------------------------------------------------------- sidebar
 ASHA = "Demo: Asha (test score missing in record)"
 PRESETS = {
     ASHA: dict(gpa=3.6, test=78.0, essay=7.0, rec=8.0, extra=4.0, income=40.0,
@@ -195,18 +192,15 @@ sv = contribs(xs)
 dec = decision(prob)
 checks = data_checks(row, S.test_missing, S.income_missing)
 
-# what-if: same applicant with the missing values resolved (entered values used)
 resolved = dict(row, test_score=S.test, family_income_k=S.income)
 p_res, _ = predict(resolved)
 changed_by_fix = bool(S.test_missing or S.income_missing) and decision(p_res) != dec
 
-# nearest synthetic applicants with a different model outcome
 allx = M["sc"].transform(M["all"][FEATURES])
 dist = np.linalg.norm(allx - xs, axis=1)
 M_all = M["all"].assign(distance=dist)
 neighbor = M_all[M_all.pred != int(prob >= THRESHOLD)].sort_values("distance").head(3)
 
-# group audit
 te = M["te"]
 rows = []
 for g, s in te.groupby("region"):
@@ -216,7 +210,6 @@ grp = pd.DataFrame(rows)
 di = grp["Selection rate"].min() / grp["Selection rate"].max()
 low_g = grp.loc[grp["Selection rate"].idxmin(), "Group"]
 
-# ---------------------------------------------------------------- header
 st.title("OpportunityLens")
 st.caption("Understand the decision. Examine the difference. Question the outcome.  |  "
            "Simulated data - research prototype, not proof of discrimination.")
@@ -230,7 +223,6 @@ if changed_by_fix:
 
 t1, t2, t3, t4, t5, t6 = st.tabs(["1 Explain", "2 Check data", "3 Compare", "4 Model & groups", "5 Decision Receipt", "6 Validation"])
 
-# ---------------------------------------------------------------- explain
 with t1:
     st.subheader("Why did the model predict this? (local SHAP)")
     order = np.argsort(np.abs(sv))
@@ -252,7 +244,6 @@ with t1:
     st.plotly_chart(px.bar(gdf, x="Mean |SHAP|", y="Feature", orientation="h", height=300), width="stretch")
     st.info("Feature importance describes the model's behaviour. It does not prove that a feature caused the outcome.")
 
-# ---------------------------------------------------------------- data checks
 with t2:
     st.subheader("Information that may need verification")
     if not checks:
@@ -263,7 +254,6 @@ with t2:
     st.dataframe(pd.DataFrame({"Feature": [NAMES[f] for f in FEATURES], "Model input": [row[f] for f in FEATURES],
                                "Value entered": [resolved[f] for f in FEATURES]}), hide_index=True, width="stretch")
 
-# ---------------------------------------------------------------- compare
 with t3:
     st.subheader("Controlled comparison: current profile (A) vs what-if profile (B)")
     st.caption("Edit B to test one change at a time. A changed output is a signal to investigate, not proof of discrimination.")
@@ -288,7 +278,6 @@ with t3:
     nb.columns = [NAMES.get(c, c) for c in nb.columns]
     st.dataframe(nb.round(2), hide_index=True, width="stretch")
 
-# ---------------------------------------------------------------- model + groups
 with t4:
     m = M["m"]
     st.subheader("Model performance (held-out synthetic test set)")
@@ -310,7 +299,6 @@ with t4:
             "not show the model is valid for real scholarship decisions.")
 
 
-# ---------------------------------------------------------------- receipt
 def build_receipt():
     top = [plain(FEATURES[i], row[FEATURES[i]], sv[i]) for i in np.argsort(-np.abs(sv))[:3]]
     L = ["# Decision Receipt - OpportunityLens", f"Generated: {datetime.now():%Y-%m-%d %H:%M}",
@@ -402,7 +390,6 @@ with t5:
         d3.download_button("⬇ Receipt (.pdf)", to_pdf(md), "decision_receipt.pdf", "application/pdf")
 
 
-# ---------------------------------------------------------------- validation
 TRUE_W = {"gpa": 0.9, "test_score": 0.7, "family_income_k": 0.6, "essay_score": 0.5,
           "recommendation": 0.4, "extracurriculars": 0.3}
 
