@@ -9,9 +9,13 @@ import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
+from sklearn.calibration import calibration_curve
+from sklearn.dummy import DummyClassifier
+from sklearn.ensemble import GradientBoostingClassifier
 from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import accuracy_score, confusion_matrix, f1_score, precision_score, recall_score
-from sklearn.model_selection import train_test_split
+from sklearn.metrics import (accuracy_score, brier_score_loss, confusion_matrix, f1_score, precision_score,
+                             recall_score, roc_auc_score)
+from sklearn.model_selection import cross_val_score, train_test_split
 from sklearn.preprocessing import StandardScaler
 
 try:
@@ -19,6 +23,12 @@ try:
     HAS_SHAP = True
 except Exception:  # fallback keeps the demo alive if shap fails to install
     HAS_SHAP = False
+
+try:
+    from fpdf import FPDF
+    HAS_PDF = True
+except Exception:
+    HAS_PDF = False
 
 st.set_page_config(page_title="OpportunityLens", page_icon="🔍", layout="wide")
 
@@ -59,22 +69,40 @@ def train():
     d = make_data()
     tr, te = train_test_split(d, test_size=0.25, random_state=1, stratify=d.y)
     sc = StandardScaler().fit(tr[FEATURES])
-    Xtr = sc.transform(tr[FEATURES])
-    model = LogisticRegression(max_iter=1000).fit(Xtr, tr.y)
+    Xtr, Xte = sc.transform(tr[FEATURES]), sc.transform(te[FEATURES])
+    cands = {"Logistic regression": LogisticRegression(max_iter=1000)}
+    if HAS_SHAP:
+        cands["Gradient boosting"] = GradientBoostingClassifier(random_state=0)
+    cv = {n: float(cross_val_score(m, Xtr, tr.y, cv=5, scoring="roc_auc").mean()) for n, m in cands.items()}
+    fitted = {n: m.fit(Xtr, tr.y) for n, m in cands.items()}
+    test_auc = {n: float(roc_auc_score(te.y, m.predict_proba(Xte)[:, 1])) for n, m in fitted.items()}
+    best = "Logistic regression"  # prefer the simpler model unless the complex one is clearly better
+    if "Gradient boosting" in cv and cv["Gradient boosting"] > cv["Logistic regression"] + 0.01:
+        best = "Gradient boosting"
+    model = fitted[best]
     te = te.copy()
-    te["prob"] = model.predict_proba(sc.transform(te[FEATURES]))[:, 1]
+    te["prob"] = model.predict_proba(Xte)[:, 1]
     te["pred"] = (te.prob >= THRESHOLD).astype(int)
-    expl = shap.LinearExplainer(model, Xtr) if HAS_SHAP else None
+    if HAS_SHAP:
+        expl = shap.LinearExplainer(model, Xtr) if best == "Logistic regression" else shap.TreeExplainer(model)
+    else:
+        expl = None
+    base = float(model.decision_function(Xtr).mean())
+    if best != "Logistic regression" and expl is not None:
+        base = float(np.ravel(expl.expected_value)[0])
     allp = d.copy()
     allp["prob"] = model.predict_proba(sc.transform(d[FEATURES]))[:, 1]
     allp["pred"] = (allp.prob >= THRESHOLD).astype(int)
+    dummy = DummyClassifier(strategy="most_frequent").fit(Xtr, tr.y)
+    fp, mp = calibration_curve(te.y, te.prob, n_bins=8, strategy="quantile")
     metrics = dict(accuracy=accuracy_score(te.y, te.pred), precision=precision_score(te.y, te.pred),
                    recall=recall_score(te.y, te.pred), f1=f1_score(te.y, te.pred),
-                   cm=confusion_matrix(te.y, te.pred))
-    base = float(model.decision_function(Xtr).mean())
+                   cm=confusion_matrix(te.y, te.pred), auc=float(roc_auc_score(te.y, te.prob)),
+                   brier=float(brier_score_loss(te.y, te.prob)),
+                   base_acc=accuracy_score(te.y, dummy.predict(Xte)), cal=(mp, fp))
     lo, hi = tr[FEATURES].quantile(0.01), tr[FEATURES].quantile(0.99)
-    return dict(sc=sc, model=model, te=te, expl=expl, all=allp, m=metrics, base=base, lo=lo, hi=hi, ntrain=len(tr))
-
+    return dict(sc=sc, model=model, best=best, cv=cv, test_auc=test_auc, te=te, tr=tr, expl=expl, all=allp,
+                m=metrics, base=base, lo=lo, hi=hi, ntrain=len(tr))
 
 M = train()
 
@@ -88,7 +116,7 @@ def contribs(xs):
     """SHAP values (log-odds) for one scaled row; falls back to coef*x (identical for a linear model)."""
     if M["expl"] is not None:
         try:
-            return np.array(M["expl"].shap_values(xs)).reshape(-1)
+            return np.array(M["expl"].shap_values(xs)).reshape(-1)[-len(FEATURES):]
         except Exception:
             pass
     return M["model"].coef_[0] * xs[0]
@@ -118,7 +146,9 @@ def data_checks(row, test_missing, income_missing):
 
 
 def plain(f, v, c):
-    return f"{NAMES[f]} = {v:.1f} {'pushed the score UP' if c > 0 else 'pushed the score DOWN'} ({c:+.2f} log-odds)"
+    mag = "strongly" if abs(c) > 1.5 else "moderately" if abs(c) > 0.5 else "slightly"
+    return (f"{NAMES[f]} ({v:.1f}) {mag} {'raised' if c > 0 else 'lowered'} the chance of being shortlisted "
+            f"({c:+.2f} log-odds)")
 
 
 # ---------------------------------------------------------------- sidebar
@@ -198,7 +228,7 @@ if changed_by_fix:
     st.warning(f"With the missing value(s) resolved, the model output changes to **{decision(p_res)}** "
                f"({p_res:.1%}). This is a warning signal worth human review, not proof of unfairness.")
 
-t1, t2, t3, t4, t5 = st.tabs(["1 Explain", "2 Check data", "3 Compare", "4 Model & groups", "5 Decision Receipt"])
+t1, t2, t3, t4, t5, t6 = st.tabs(["1 Explain", "2 Check data", "3 Compare", "4 Model & groups", "5 Decision Receipt", "6 Validation"])
 
 # ---------------------------------------------------------------- explain
 with t1:
@@ -209,7 +239,7 @@ with t1:
     fig.update_layout(height=320, xaxis_title="Contribution to log-odds of shortlisting",
                       margin=dict(l=0, r=0, t=10, b=0))
     st.plotly_chart(fig, width="stretch")
-    st.caption(f"Baseline log-odds {M['base']:+.2f} + contributions {sv.sum():+.2f} = "
+    st.caption(f"Model: {M['best']}. Baseline log-odds {M['base']:+.2f} + contributions {sv.sum():+.2f} = "
                f"{M['base'] + sv.sum():+.2f} (model output). Explainer: "
                f"{'SHAP LinearExplainer' if M['expl'] is not None else 'linear contributions (SHAP unavailable)'}.")
     for i in np.argsort(-np.abs(sv))[:3]:
@@ -286,42 +316,49 @@ def build_receipt():
     L = ["# Decision Receipt - OpportunityLens", f"Generated: {datetime.now():%Y-%m-%d %H:%M}",
          "SIMULATED data and model. Not a real scholarship decision.", "",
          "## 1. What happened?",
-         f"- Model prediction: {dec}", f"- Prediction score: {prob:.1%} (threshold {THRESHOLD:.0%})",
-         f"- Model: logistic regression trained on {M['ntrain']} synthetic applicants", "",
+         f"- Simulated outcome: {dec}",
+         f"- Prediction score: {prob:.1%} (decision threshold {THRESHOLD:.0%})",
+         f"- Model: {M['best']} trained on {M['ntrain']} synthetic applicants (test ROC-AUC {M['m']['auc']:.2f})", "",
          "## 2. Why did it happen?"] + [f"- {t}" for t in top] + [
-         "- These are model contributions (SHAP), not proof of causation.", "",
-         "## 3. What should be checked?"]
-    L += [f"- [{s}] {m_}" for s, m_ in checks] or ["- No automated input issues detected (does not guarantee correctness)."]
-    if S.test_missing or S.income_missing:
-        L.append(f"- With missing values resolved the output would be: {decision(p_res)} ({p_res:.1%})")
-    L += ["", "## 4. Is there a warning signal?",
-          f"- Test accuracy {M['m']['accuracy']:.1%}, precision {M['m']['precision']:.1%}, "
-          f"recall {M['m']['recall']:.1%}, F1 {M['m']['f1']:.1%}",
-          f"- Selection-rate ratio across regions: {di:.2f} (lower group: {low_g})"
-          + (" - below 0.80, investigate" if di < 0.8 else " - above 0.80"),
-          "- Closest synthetic applicants with a different outcome:"]
+         "- These are SHAP model contributions, not proof of causation.", "",
+         "## 3. Was it consistent?",
+         "- Closest synthetic applicants with a different outcome:"]
     for _, r_ in neighbor.iterrows():
         L.append(f"- GPA {r_.gpa:.2f}, test {r_.test_score:.0f}, essay {r_.essay_score:.1f}, "
                  f"income {r_.family_income_k:.0f}k -> {decision(r_.prob)} ({r_.prob:.1%})")
-    L += ["", "## 5. What happens next? Questions for human review",
-          "- Is the flagged information correct? Verify against source documents." if checks
-          else "- Confirm the inputs against source documents.",
-          "- Would a human reviewer reach the same outcome after correcting the record?",
-          "- Does the selection-rate gap between groups have a legitimate explanation?",
-          "- Can the applicant see this explanation and request a review?", "",
-          "## Limitations",
+    L += [f"- Selection-rate ratio across regions: {di:.2f} (lower group: {low_g})"
+          + (" - below 0.80, investigate" if di < 0.8 else " - above 0.80"),
+          f"- Test accuracy {M['m']['accuracy']:.1%}, precision {M['m']['precision']:.1%}, "
+          f"recall {M['m']['recall']:.1%}, F1 {M['m']['f1']:.1%}", "",
+          "## 4. What can be challenged?"]
+    L += [f"- [{s_}] {m_}" for s_, m_ in checks] or ["- No automated input issues detected (does not guarantee correctness)."]
+    if S.test_missing or S.income_missing:
+        L.append(f"- With missing values resolved the output would be: {decision(p_res)} ({p_res:.1%})")
+    L.append("- Route to review: the applicant may request a human review of the flagged items and this explanation.")
+    note = (S.get("review_note", "") or "").strip()
+    if note:
+        L.append(f"- Applicant review request: {note}")
+    L += ["", "## 5. What are the limits?",
           "- Feature importance does not prove causation.",
           "- A changed prediction after editing an input does not by itself prove discrimination.",
           "- Group differences are signals for investigation, not verified findings.",
           "- Performance on synthetic data does not show validity for real decisions.",
-          "- This prototype must not be used for actual eligibility or scholarship decisions."]
+          "- This prototype must not be used for actual eligibility or scholarship decisions.",
+          "- Reviewer should inspect: flagged inputs, the source documents, similar cases and the group gap above."]
     return "\n".join(L)
 
 
 def to_html(md):
+    mx = max(np.abs(sv).max(), 1e-9)
+    bars = "<h3>Visual breakdown (SHAP contribution)</h3>" + "".join(
+        f"<div style='display:flex;align-items:center;margin:3px 0'><span style='width:190px'>{NAMES[FEATURES[i]]}</span>"
+        f"<div style='height:14px;width:{abs(sv[i]) / mx * 220:.0f}px;background:{'#2e7d32' if sv[i] > 0 else '#c62828'}'></div>"
+        f"<span style='margin-left:8px'>{sv[i]:+.2f}</span></div>" for i in np.argsort(-np.abs(sv)))
     out = []
     for l in md.split("\n"):
         e = html.escape(l.strip())
+        if l.startswith("## 3."):
+            out.append(bars)
         if l.startswith("# "):
             out.append(f"<h1>{html.escape(l[2:])}</h1>")
         elif l.startswith("## "):
@@ -334,10 +371,109 @@ def to_html(md):
             + "\n".join(out) + "</body></html>")
 
 
+def to_pdf(md):
+    pdf = FPDF()
+    pdf.add_page()
+    pdf.set_auto_page_break(True, 15)
+    for l in md.split("\n"):
+        t = l.encode("latin-1", "replace").decode("latin-1")
+        if l.startswith("## "):
+            pdf.set_font("Helvetica", "B", 12)
+            t = t[3:]
+        elif l.startswith("# "):
+            pdf.set_font("Helvetica", "B", 16)
+            t = t[2:]
+        else:
+            pdf.set_font("Helvetica", "", 10)
+        pdf.multi_cell(0, 6, t or " ", new_x="LMARGIN", new_y="NEXT")
+    return bytes(pdf.output())
+
+
 with t5:
     st.subheader("Decision Receipt")
+    st.plotly_chart(fig, width="stretch", key="receipt_fig")
+    st.text_area("Request human review (optional): what should a reviewer check?", key="review_note")
     md = build_receipt()
     st.markdown(md)
-    d1, d2 = st.columns(2)
-    d1.download_button("⬇ Download receipt (.md)", md, "decision_receipt.md", "text/markdown")
-    d2.download_button("⬇ Download receipt (.html)", to_html(md), "decision_receipt.html", "text/html")
+    d1, d2, d3 = st.columns(3)
+    d1.download_button("⬇ Receipt (.html)", to_html(md), "decision_receipt.html", "text/html")
+    d2.download_button("⬇ Receipt (.md)", md, "decision_receipt.md", "text/markdown")
+    if HAS_PDF:
+        d3.download_button("⬇ Receipt (.pdf)", to_pdf(md), "decision_receipt.pdf", "application/pdf")
+
+
+# ---------------------------------------------------------------- validation
+TRUE_W = {"gpa": 0.9, "test_score": 0.7, "family_income_k": 0.6, "essay_score": 0.5,
+          "recommendation": 0.4, "extracurriculars": 0.3}
+
+
+@st.cache_resource
+def detection():
+    smp = M["te"].sample(300, random_state=3)
+
+    def flagged(df):
+        return float(np.mean([any(sev == "High" for sev, _ in data_checks(x, False, False))
+                              for x in df[FEATURES].to_dict("records")]))
+
+    def preds(df):
+        return M["model"].predict_proba(M["sc"].transform(df[FEATURES]))[:, 1] >= THRESHOLD
+
+    zero = smp.assign(test_score=0.0)
+    imputed = smp.assign(test_score=float(M["all"].test_score.median()))
+    was = smp.pred.values == 1
+    flip = float((~preds(zero)[was]).mean()) if was.any() else float("nan")
+    r = np.random.default_rng(7)
+    tr = M["tr"].copy()
+    hit = (tr.region == "Rural") & (tr.y == 1) & (r.random(len(tr)) < 0.3)
+    tr.loc[hit, "y"] = 0  # simulated bias: some rural positives wrongly labelled "no"
+    bm = LogisticRegression(max_iter=1000).fit(M["sc"].transform(tr[FEATURES]), tr.y)
+    bp = pd.Series(bm.predict_proba(M["sc"].transform(M["te"][FEATURES]))[:, 1] >= THRESHOLD, index=M["te"].index)
+    br = bp.groupby(M["te"].region).mean()
+    cr = M["te"].groupby("region").pred.mean()
+    return dict(zero=flagged(zero), imputed=flagged(imputed), flip=flip, n=len(smp),
+                clean=cr.min() / cr.max(), biased=br.min() / br.max(), biased_rates=br)
+
+
+with t6:
+    m = M["m"]
+    st.subheader("Model quality")
+    cvdf = pd.DataFrame({"Model": list(M["cv"]), "5-fold CV ROC-AUC (train)": list(M["cv"].values()),
+                         "Test ROC-AUC": [M["test_auc"][n] for n in M["cv"]]})
+    st.dataframe(cvdf.round(3), hide_index=True, width="stretch")
+    st.caption(f"Selected by cross-validation (simpler model preferred unless clearly worse): **{M['best']}**.")
+    q = st.columns(4)
+    q[0].metric("Test accuracy", f"{m['accuracy']:.1%}", f"baseline {m['base_acc']:.1%}", delta_color="off")
+    q[1].metric("Test ROC-AUC", f"{m['auc']:.3f}", "baseline 0.500", delta_color="off")
+    q[2].metric("Brier score (lower=better)", f"{m['brier']:.3f}")
+    q[3].metric("Selected model", M["best"])
+    mp, fp = m["cal"]
+    cal = go.Figure([go.Scatter(x=mp, y=fp, mode="lines+markers", name="Model"),
+                     go.Scatter(x=[0, 1], y=[0, 1], mode="lines", name="Perfect calibration", line=dict(dash="dash"))])
+    cal.update_layout(height=300, xaxis_title="Predicted probability", yaxis_title="Observed shortlist rate",
+                      margin=dict(l=0, r=0, t=10, b=0))
+    st.plotly_chart(cal, width="stretch", key="cal_fig")
+
+    st.subheader("Detection test (injected problems)")
+    D = detection()
+    st.write(f"**Injected missing test score** (recorded as 0) in {D['n']} test applicants: the input check flagged "
+             f"**{D['zero']:.0%}**; among applicants the model had shortlisted, **{D['flip']:.0%}** flipped to "
+             f"'Not shortlisted'.")
+    st.write(f"**Injected silent imputation** (missing test score replaced by the median): the input check flagged "
+             f"**{D['imputed']:.0%}**. " + ("This is a MISS - silently imputed values cannot be detected by these rules."
+                                          if D["imputed"] < 0.5 else ""))
+    st.write(f"**Injected simulated bias** (30% of rural positive labels flipped to 'no' in training): selection-rate "
+             f"ratio **{D['biased']:.2f}** vs **{D['clean']:.2f}** for the clean model -> "
+             + ("flagged by the 0.80 audit rule." if D["biased"] < 0.8 else "NOT flagged by the 0.80 audit rule (a miss)."))
+
+    st.subheader("Explanation check (SHAP vs the known synthetic rules)")
+    gv = np.abs(raw).mean(0)
+    ex = pd.DataFrame({"Feature": [NAMES[f] for f in FEATURES], "True rule weight": [TRUE_W[f] for f in FEATURES],
+                       "Mean |SHAP|": gv})
+    st.dataframe(ex.round(3), hide_index=True, width="stretch")
+    rho = pd.Series(ex["True rule weight"].values).corr(pd.Series(gv), method="spearman")
+    t3t = set(ex.nlargest(3, "True rule weight").Feature) == set(ex.nlargest(3, "Mean |SHAP|").Feature)
+    st.write(f"Rank correlation (Spearman) = **{rho:.2f}**. Top-3 drivers {'match' if t3t else 'do NOT match'} the rules.")
+
+    w1, w2 = st.columns(2)
+    w1.success("**What this proves:** the prototype behaves as designed on controlled synthetic data.")
+    w2.error("**What it does not prove:** real-world fairness, causation or discrimination.")
