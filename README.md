@@ -113,5 +113,5 @@ Synthetic data only. One scenario, one simple model, and no real-stakeholder eva
 
 ## Credits / attributions
 - [SHAP](https://github.com/shap/shap), [scikit-learn](https://scikit-learn.org), [Streamlit](https://streamlit.io), [Plotly](https://plotly.com), [pandas](https://pandas.pydata.org), [NumPy](https://numpy.org), [fpdf2](https://github.com/py-pdf/fpdf2)
-- AI assistance: Claude (Anthropic) was used to help scaffold code and documentation. Disclose this according to the hackathon's rules.
-- Team members: `Member 1`, `Member 2`, `Member 3`
+- AI assistance: Claude (Anthropic) was used to help scaffold code and documentation. 
+
