@@ -5,7 +5,7 @@
 An explainable-AI decision-auditing prototype, demonstrated on a **simulated** scholarship-shortlisting scenario.
 Research and demonstration prototype only. It is **not** a real scholarship system and **not** proof that any institution discriminated against anyone.
 
-- **Live demo:** `(https://opportunitylens-qyquhwnql5icnqbgzkdb94.streamlit.app)`
+- **Live demo:** `-  https://opportunitylens-qyquhwnql5icnqbgzkdb94.streamlit.app`
 
 ## Team
 - **Team name:** `POWERPUFF GURLS`
